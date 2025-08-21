@@ -333,4 +333,26 @@ contract BrokexOrders {
         require(p.trader != address(0), "position:empty");
         return p;
     }
+    function deletePosition(uint256 positionId) external {
+        Position memory p = _requireExistingPosition(positionId);
+        require(msg.sender == p.trader, "not allowed");
+        delete positions[positionId];
+    }
+    
+    function deleteMarketOrder(uint256 orderId) external {
+        require(orderId != 0 && orderId <= marketOrderCount, "order:not found");
+        MarketOrder memory o = marketOrders[orderId];
+        require(o.trader != address(0), "order:empty");
+        require(msg.sender == o.trader, "not allowed");
+        delete marketOrders[orderId];
+    }
+    
+    function deleteLimitOrder(uint256 orderId) external {
+        require(orderId != 0 && orderId <= limitOrderCount, "order:not found");
+        LimitOrder memory o = limitOrders[orderId];
+        require(o.trader != address(0), "order:empty");
+        require(msg.sender == o.trader, "not allowed");
+        delete limitOrders[orderId];
+    }
+
 }
