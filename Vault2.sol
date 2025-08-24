@@ -1,279 +1,286 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
-/// @title BrokexVault - Gestion de marges, commissions et PnL pour Brokex
-/// @notice Déployez avec l'ERC20 utilisé (USDT/USDC), l'adresse commissionReceiver et l'adresse pnlVault.
-/// @dev Compatible EVM (ex: Pharos Testnet chainId 688688). Aucune import externe requise.
+/**
+ * Brokex Vault
+ * - Stocke et règle la marge, les commissions et le PnL des ordres/positions.
+ * - Les fonctions critiques sont appelables uniquement par brokexStorage.
+ * - Compliant avec l'exigence réseau: CHAIN_ID = 688688 (constante exposée).
+ */
 
-interface IERC20 {
-    function totalSupply() external view returns (uint256);
-    function balanceOf(address a) external view returns (uint256);
-    function transfer(address to, uint256 v) external returns (bool);
-    function allowance(address o, address s) external view returns (uint256);
-    function approve(address s, uint256 v) external returns (bool);
-    function transferFrom(address f, address t, uint256 v) external returns (bool);
-    event Transfer(address indexed from, address indexed to, uint256 value);
-    event Approval(address indexed owner, address indexed spender, uint256 value);
-}
-
-library SafeERC20 {
-    function safeTransfer(IERC20 token, address to, uint256 value) internal {
-        bytes memory data = abi.encodeWithSelector(token.transfer.selector, to, value);
-        (bool ok, bytes memory ret) = address(token).call(data);
-        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "TRANSFER_FAILED");
-    }
-    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
-        bytes memory data = abi.encodeWithSelector(token.transferFrom.selector, from, to, value);
-        (bool ok, bytes memory ret) = address(token).call(data);
-        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "TRANSFER_FROM_FAILED");
-    }
-}
-
-abstract contract Ownable {
-    address public owner;
-    modifier onlyOwner() { require(msg.sender == owner, "ONLY_OWNER"); _; }
-    constructor() { owner = msg.sender; }
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "ZERO_OWNER");
-        owner = newOwner;
-    }
-}
-
-abstract contract ReentrancyGuard {
-    uint256 private _status;
-    constructor() { _status = 1; }
-    modifier nonReentrant() {
-        require(_status == 1, "REENTRANCY");
-        _status = 2;
-        _;
-        _status = 1;
-    }
-}
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract BrokexVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // === Config & rôles ===
-    IERC20  public immutable token;            // ex: USDT/USDC
-    address public executor;                   // autorisé à convertir/fermer/rembourser
-    address public commissionReceiver;         // celui qui encaisse les commissions
-    address public pnlVault;                   // récepteur/payeur de PnL (pool)
+    // ---- Constantes / Config ----
+    uint256 public constant CHAIN_ID = 688688;
 
-    modifier onlyExecutor() { require(msg.sender == executor, "ONLY_EXECUTOR"); _; }
-    modifier onlyCommissionReceiver() { require(msg.sender == commissionReceiver, "ONLY_COMMISSION_RECEIVER"); _; }
-    modifier onlyPnlVault() { require(msg.sender == pnlVault, "ONLY_PNL_VAULT"); _; }
+    IERC20 public immutable asset;            // stablecoin utilisé pour les règlements
+    address public brokexStorage;             // seul cet addr peut appeler les fonctions cœur
+    address public commissionReceiver;        // reçoit les commissions (solde interne + retrait)
+    address public pnlBank;                   // banque PnL (receiver/payeur)
 
-    constructor(IERC20 _token, address _commissionReceiver, address _pnlVault) {
-        require(address(_token) != address(0), "ZERO_TOKEN");
-        require(_commissionReceiver != address(0), "ZERO_COMM");
-        require(_pnlVault != address(0), "ZERO_PNL");
-        token = _token;
-        commissionReceiver = _commissionReceiver;
-        pnlVault = _pnlVault;
-        executor = msg.sender; // par défaut
+    // ---- Etats ----
+    struct LockedOrder {
+        address trader;
+        uint256 margin;
+        uint256 commission;
     }
 
-    function setExecutor(address _exec) external onlyOwner {
-        require(_exec != address(0), "ZERO_EXEC");
-        executor = _exec;
-    }
-    function setCommissionReceiver(address _cr) external onlyOwner {
-        require(_cr != address(0), "ZERO_COMM");
-        commissionReceiver = _cr;
-    }
-    function setPnlVault(address _pnl) external onlyOwner {
-        require(_pnl != address(0), "ZERO_PNL");
-        pnlVault = _pnl;
+    struct Position {
+        address trader;
+        uint256 margin; // marge encore immobilisée (hors commissions déjà envoyées)
     }
 
-    // === États ===
+    mapping(uint256 => LockedOrder) private orders;     // orderId => LockedOrder
+    mapping(uint256 => Position)    private positions;  // positionId => Position
 
-    struct OrderFunds {
-        uint256 margin;        // marge bloquée pour l'ordre
-        uint256 commission;    // commission associée à l'ordre
-        address trader;        // propriétaire
-    }
+    // soldes internes par adresse (on garde historiques si on change de receiver)
+    mapping(address => uint256) public accruedCommission;
+    mapping(address => uint256) public pnlBankBalance; // solde disponible pour payer PnL positifs
 
-    // Ordres en attente (marge+commission conservées ici jusqu'à conversion/annulation)
-    mapping(uint256 => OrderFunds) public orders; // orderId => funds
-
-    // Positions ouvertes (marge immobilisée sur la position)
-    mapping(uint256 => uint256) public positionMargin; // positionId => margin
-    mapping(uint256 => address) public positionTrader; // positionId => trader
-
-    // Commissions cumulées (retirables par commissionReceiver)
-    uint256 public commissionAccrued;
-
-    // Solde interne du pnlVault détenu dans ce contrat (sert à payer les profits)
-    uint256 public pnlVaultBalance;
-
-    // === Events ===
+    // ---- Events ----
+    event StorageUpdated(address indexed oldAddr, address indexed newAddr);
+    event CommissionReceiverUpdated(address indexed oldAddr, address indexed newAddr);
+    event PnlBankUpdated(address indexed oldAddr, address indexed newAddr);
 
     event OrderDeposited(uint256 indexed orderId, address indexed trader, uint256 margin, uint256 commission);
     event OrderRefunded(uint256 indexed orderId, address indexed trader, uint256 amount);
-    event OrderConverted(uint256 indexed orderId, uint256 indexed positionId, address indexed trader, uint256 margin, uint256 commission);
-    event CommissionAccrued(uint256 amount);
-    event CommissionWithdrawn(address indexed to, uint256 amount);
-    event PnlVaultDeposited(uint256 amount);
-    event PnlVaultWithdrawn(address indexed to, uint256 amount);
+    event OrderConverted(uint256 indexed orderId, uint256 indexed positionId, address indexed trader, uint256 margin, uint256 commissionToReceiver);
+
     event PositionClosed(
         uint256 indexed positionId,
         address indexed trader,
         int256 pnl,
         uint256 closingCommission,
         uint256 traderPayout,
-        int256 poolDelta // +ve = le pool encaisse, -ve = le pool paye
+        uint256 pnlBankDelta // + augmente la banque (trader perd), - diminue la banque (trader gagne)
     );
 
-    // === Helpers vue ===
-    function getOrderLocked(uint256 orderId) external view returns (uint256 margin, uint256 commission, address trader) {
-        OrderFunds memory f = orders[orderId];
-        return (f.margin, f.commission, f.trader);
+    event CommissionWithdrawn(address indexed receiver, uint256 amount);
+    event PnlBankReplenished(address indexed bank, uint256 amount);
+    event PnlBankWithdrawn(address indexed bank, uint256 amount);
+
+    // ---- Modifiers ----
+    modifier onlyStorage() {
+        require(msg.sender == brokexStorage, "BrokexVault: only storage");
+        _;
     }
 
-    function getPosition(uint256 positionId) external view returns (address trader, uint256 margin) {
-        return (positionTrader[positionId], positionMargin[positionId]);
+    // ---- Constructor ----
+    constructor(
+        address _asset,
+        address _brokexStorage,
+        address _commissionReceiver,
+        address _pnlBank
+    ) Ownable(msg.sender) {
+        require(_asset != address(0), "asset=0");
+        require(_brokexStorage != address(0), "storage=0");
+        require(_commissionReceiver != address(0), "commissionReceiver=0");
+        require(_pnlBank != address(0), "pnlBank=0");
+
+        asset = IERC20(_asset);
+        brokexStorage = _brokexStorage;
+        commissionReceiver = _commissionReceiver;
+        pnlBank = _pnlBank;
     }
 
-    // === 1) Dépôt pour un ordre: prélève marge + commission du trader ===
-    function depositForOrder(uint256 orderId, uint256 margin, uint256 commission) external nonReentrant {
-        require(orderId != 0, "ORDERID_0");
-        require(orders[orderId].trader == address(0), "ORDER_EXISTS");
-        require(margin > 0, "MARGIN_0");
-        // commission peut être 0 si nécessaire
+    // ---- Admin (owner) ----
+    function setBrokexStorage(address _storage) external onlyOwner {
+        require(_storage != address(0), "storage=0");
+        emit StorageUpdated(brokexStorage, _storage);
+        brokexStorage = _storage;
+    }
+
+    function setCommissionReceiver(address _receiver) external onlyOwner {
+        require(_receiver != address(0), "receiver=0");
+        emit CommissionReceiverUpdated(commissionReceiver, _receiver);
+        commissionReceiver = _receiver;
+    }
+
+    function setPnlBank(address _pnlBank) external onlyOwner {
+        require(_pnlBank != address(0), "pnlBank=0");
+        emit PnlBankUpdated(pnlBank, _pnlBank);
+        pnlBank = _pnlBank;
+    }
+
+    // ---- Flux PnL bank (le bank peut alimenter ou retirer son solde) ----
+
+    /// @notice Dépose des fonds dans la banque PnL (réserve pour payer les PnL positifs)
+    /// @dev nécessite allowance vers ce contrat
+    function pnlBankReplenish(uint256 amount) external nonReentrant {
+        require(msg.sender == pnlBank, "only pnlBank");
+        require(amount > 0, "amount=0");
+        asset.safeTransferFrom(msg.sender, address(this), amount);
+        pnlBankBalance[pnlBank] += amount;
+        emit PnlBankReplenished(pnlBank, amount);
+    }
+
+    /// @notice Retire des fonds disponibles de la banque PnL
+    function pnlBankWithdraw(uint256 amount) external nonReentrant {
+        require(msg.sender == pnlBank, "only pnlBank");
+        require(amount > 0, "amount=0");
+        require(pnlBankBalance[pnlBank] >= amount, "pnl reserve insufficient");
+        pnlBankBalance[pnlBank] -= amount;
+        asset.safeTransfer(pnlBank, amount);
+        emit PnlBankWithdrawn(pnlBank, amount);
+    }
+
+    // ---- Commission receiver ----
+    function withdrawCommission(uint256 amount) external nonReentrant {
+        address receiver = msg.sender;
+        require(accruedCommission[receiver] >= amount, "insufficient commission");
+        accruedCommission[receiver] -= amount;
+        asset.safeTransfer(receiver, amount);
+        emit CommissionWithdrawn(receiver, amount);
+    }
+
+    // ---- Cœur: Ordres & Positions (uniquement brokexStorage) ----
+
+    /**
+     * @notice Dépose marge + commission pour un ordre.
+     * @dev Le prélèvement se fait sur le TRADER via transferFrom, donc
+     *      le trader doit avoir approuvé le Vault au préalable.
+     */
+    function depositForOrder(
+        uint256 orderId,
+        address trader,
+        uint256 margin,
+        uint256 commission
+    ) external onlyStorage nonReentrant {
+        require(trader != address(0), "trader=0");
+        require(margin > 0, "margin=0");
+        require(orders[orderId].trader == address(0), "order exists");
+        require(positions[orderId].trader == address(0), "id collision");
 
         uint256 total = margin + commission;
-        token.safeTransferFrom(msg.sender, address(this), total);
+        asset.safeTransferFrom(trader, address(this), total);
 
-        orders[orderId] = OrderFunds({
+        orders[orderId] = LockedOrder({
+            trader: trader,
             margin: margin,
-            commission: commission,
-            trader: msg.sender
+            commission: commission
         });
 
-        emit OrderDeposited(orderId, msg.sender, margin, commission);
+        emit OrderDeposited(orderId, trader, margin, commission);
     }
 
-    // === 2) Remboursement d'un ordre (marge + commission) ===
-    function refundOrder(uint256 orderId, address to) external onlyExecutor nonReentrant {
-        OrderFunds memory f = orders[orderId];
-        require(f.trader != address(0), "ORDER_NOT_FOUND");
-        require(to == f.trader, "TO_NEQ_TRADER"); // sécurité: on renvoie au vrai trader
+    /**
+     * @notice Rembourse marge + commission d'un ordre en attente.
+     */
+    function refundOrder(uint256 orderId) external onlyStorage nonReentrant {
+        LockedOrder memory o = orders[orderId];
+        require(o.trader != address(0), "order not found");
 
         delete orders[orderId];
 
-        uint256 amount = f.margin + f.commission;
-        token.safeTransfer(to, amount);
+        uint256 refundAmount = o.margin + o.commission;
+        asset.safeTransfer(o.trader, refundAmount);
 
-        emit OrderRefunded(orderId, to, amount);
+        emit OrderRefunded(orderId, o.trader, refundAmount);
     }
 
-    // === 3) Transformer un ordre en position ===
-    /// @dev Commission de l'ordre est accumulée pour commissionReceiver, marge devient marge de la position.
-    function convertOrderToPosition(uint256 orderId, uint256 positionId) external onlyExecutor nonReentrant {
-        require(positionId != 0, "POSITIONID_0");
-        require(positionTrader[positionId] == address(0), "POSITION_EXISTS");
+    /**
+     * @notice Convertit un ordre en position :
+     *  - supprime le mapping de l'ordre
+     *  - crée la position avec la marge
+     *  - crédite la commission au solde du commissionReceiver
+     */
+    function convertOrderToPosition(uint256 orderId, uint256 positionId) external onlyStorage nonReentrant {
+        LockedOrder memory o = orders[orderId];
+        require(o.trader != address(0), "order not found");
+        require(positions[positionId].trader == address(0), "position exists");
 
-        OrderFunds memory f = orders[orderId];
-        require(f.trader != address(0), "ORDER_NOT_FOUND");
-
-        // Accumule commission pour retrait ultérieur
-        if (f.commission > 0) {
-            commissionAccrued += f.commission;
-            emit CommissionAccrued(f.commission);
-        }
-
-        // Crée la position
-        positionMargin[positionId] = f.margin;
-        positionTrader[positionId] = f.trader;
-
-        // Supprime l'ordre
         delete orders[orderId];
 
-        emit OrderConverted(orderId, positionId, f.trader, f.margin, f.commission);
+        positions[positionId] = Position({ trader: o.trader, margin: o.margin });
+        accruedCommission[commissionReceiver] += o.commission;
+
+        emit OrderConverted(orderId, positionId, o.trader, o.margin, o.commission);
     }
 
-    // === 4) Retrait de commission par le commissionReceiver ===
-    function withdrawCommission(uint256 amount, address to) external onlyCommissionReceiver nonReentrant {
-        require(to != address(0), "ZERO_TO");
-        require(amount > 0 && amount <= commissionAccrued, "BAD_AMOUNT");
-        commissionAccrued -= amount;
-        token.safeTransfer(to, amount);
-        emit CommissionWithdrawn(to, amount);
-    }
+    /**
+     * @notice Ferme une position.
+     * @param positionId id de la position
+     * @param pnl PnL du trader (positif = gain pour le trader, négatif = perte pour le trader)
+     * @param closingCommission commission à prélever à la fermeture (soustraite de la marge)
+     *
+     * Règles:
+     *  - closingCommission est ajoutée au solde du commissionReceiver.
+     *  - Si pnl < 0: la perte est créditée à la banque PnL (dans la limite de la marge restante),
+     *                le reste de marge (s'il en reste) est remboursé au trader.
+     *  - Si pnl > 0: on paie le trader (marge restante + pnl) et on débite la banque PnL du montant pnl.
+     *                Nécessite que la banque PnL ait un solde suffisant.
+     *  - Si pnl == 0: la marge restante (après commission) est remboursée au trader.
+     */
+    function closePosition(
+        uint256 positionId,
+        int256 pnl,
+        uint256 closingCommission
+    ) external onlyStorage nonReentrant {
+        Position memory p = positions[positionId];
+        require(p.trader != address(0), "position not found");
 
-    // === 5) Gestion du PnL Vault (dépôt/retrait) ===
-    function pnlVaultDeposit(uint256 amount) external onlyPnlVault nonReentrant {
-        require(amount > 0, "AMOUNT_0");
-        token.safeTransferFrom(msg.sender, address(this), amount);
-        pnlVaultBalance += amount;
-        emit PnlVaultDeposited(amount);
-    }
+        // Retirer la position AVANT transferts (sécurité reentrancy)
+        delete positions[positionId];
 
-    function pnlVaultWithdraw(uint256 amount, address to) external onlyPnlVault nonReentrant {
-        require(to != address(0), "ZERO_TO");
-        require(amount > 0 && amount <= pnlVaultBalance, "BAD_AMOUNT");
-        pnlVaultBalance -= amount;
-        token.safeTransfer(to, amount);
-        emit PnlVaultWithdrawn(to, amount);
-    }
+        // 1) Prélever la commission de fermeture sur la marge disponible
+        require(p.margin >= closingCommission, "closing fee > margin");
+        uint256 marginAfterFee = p.margin - closingCommission;
+        accruedCommission[commissionReceiver] += closingCommission;
 
-    // === 6) Fermer une position ===
-    /// @param positionId id de la position à fermer
-    /// @param pnl PnL du trader (positif => on lui doit; négatif => il perd)
-    /// @param closingCommission commission de clôture (prélevée sur la marge)
-    ///
-    /// Logique:
-    /// - closingCommission est ajoutée à commissionAccrued et retirée de la marge.
-    /// - Si pnl >= 0: on paie profit au trader depuis pnlVaultBalance; il reçoit (marginNet + pnl).
-    /// - Si pnl < 0: le pool encaisse min(|pnl|, marginNet); le trader récupère le reliquat éventuel.
-    function closePosition(uint256 positionId, int256 pnl, uint256 closingCommission)
-        external
-        onlyExecutor
-        nonReentrant
-    {
-        address trader = positionTrader[positionId];
-        require(trader != address(0), "POSITION_NOT_FOUND");
+        uint256 traderPayout = 0;
+        int256 pnlBankDelta = 0;
 
-        uint256 margin = positionMargin[positionId];
-        delete positionMargin[positionId];
-        delete positionTrader[positionId];
-
-        // Commission de clôture prélevée sur la marge
-        require(closingCommission <= margin, "FEE_GT_MARGIN");
-        uint256 marginNet = margin - closingCommission;
-
-        if (closingCommission > 0) {
-            commissionAccrued += closingCommission;
-            emit CommissionAccrued(closingCommission);
-        }
-
-        uint256 traderPayout;
-        int256 poolDelta;
-
-        if (pnl >= 0) {
-            // Profit pour le trader: payé par le pool
-            uint256 profit = uint256(pnl);
-            require(pnlVaultBalance >= profit, "POOL_INSUFF");
-            pnlVaultBalance -= profit;                    // le pool paye
-            traderPayout = marginNet + profit;            // trader récupère marge nette + profit
-            poolDelta = -int256(profit);                  // delta pool négatif (il a payé)
-            token.safeTransfer(trader, traderPayout);
-        } else {
-            // Perte pour le trader: le pool encaisse jusqu'à la marge dispo
+        if (pnl < 0) {
             uint256 loss = uint256(-pnl);
-            uint256 poolGain = loss > marginNet ? marginNet : loss; // ce que le pool encaisse effectivement
-            pnlVaultBalance += poolGain;                 // le pool reçoit
-            poolDelta = int256(poolGain);                // delta pool positif (il encaisse)
-            uint256 refund = marginNet > loss ? (marginNet - loss) : 0; // reliquat éventuel pour le trader
-            traderPayout = refund;
-            if (refund > 0) {
-                token.safeTransfer(trader, refund);
+
+            // La perte est prélevée sur la marge restante et "va" à la banque PnL
+            uint256 toBank = loss > marginAfterFee ? marginAfterFee : loss;
+            if (toBank > 0) {
+                pnlBankBalance[pnlBank] += toBank;
+                pnlBankDelta = int256(toBank); // + : banque augmente
+                marginAfterFee -= toBank;
             }
-            // Si loss > marginNet, le surplus de perte n'est pas prélevé (aucune dette créée ici).
+
+            // Tout reste de marge va au trader
+            if (marginAfterFee > 0) {
+                traderPayout = marginAfterFee;
+                asset.safeTransfer(p.trader, traderPayout);
+            }
+        } else if (pnl > 0) {
+            uint256 profit = uint256(pnl);
+
+            // La banque PnL doit disposer du profit à payer
+            require(pnlBankBalance[pnlBank] >= profit, "pnl bank insufficient");
+
+            // Payer trader: marge restante + profit
+            traderPayout = marginAfterFee + profit;
+            pnlBankBalance[pnlBank] -= profit;
+            pnlBankDelta = -int256(profit); // - : banque diminue
+
+            asset.safeTransfer(p.trader, traderPayout);
+        } else {
+            // pnl == 0 → rembourser la marge restante
+            if (marginAfterFee > 0) {
+                traderPayout = marginAfterFee;
+                asset.safeTransfer(p.trader, traderPayout);
+            }
         }
 
-        emit PositionClosed(positionId, trader, pnl, closingCommission, traderPayout, poolDelta);
+        emit PositionClosed(positionId, p.trader, pnl, closingCommission, traderPayout, pnlBankDelta);
+    }
+
+    // ---- Lectures utilitaires ----
+    function getOrder(uint256 orderId) external view returns (LockedOrder memory) {
+        return orders[orderId];
+    }
+
+    function getPosition(uint256 positionId) external view returns (Position memory) {
+        return positions[positionId];
     }
 }
-
