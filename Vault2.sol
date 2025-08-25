@@ -53,13 +53,13 @@ contract BrokexVault is Ownable, ReentrancyGuard {
     event OrderConverted(uint256 indexed orderId, uint256 indexed positionId, address indexed trader, uint256 margin, uint256 commissionToReceiver);
 
     event PositionClosed(
-        uint256 indexed positionId,
-        address indexed trader,
-        int256 pnl,
-        uint256 closingCommission,
-        uint256 traderPayout,
-        uint256 pnlBankDelta // + augmente la banque (trader perd), - diminue la banque (trader gagne)
-    );
+            uint256 indexed positionId,
+            address indexed trader,
+            int256 pnl,
+            uint256 closingCommission,
+            uint256 traderPayout,
+            int256 pnlBankDelta // + : la banque encaisse, - : la banque paie
+        );
 
     event CommissionWithdrawn(address indexed receiver, uint256 amount);
     event PnlBankReplenished(address indexed bank, uint256 amount);
@@ -284,3 +284,4 @@ contract BrokexVault is Ownable, ReentrancyGuard {
         return positions[positionId];
     }
 }
+
