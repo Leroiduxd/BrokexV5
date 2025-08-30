@@ -123,8 +123,8 @@ contract BrokexStorage is Ownable {
 
     // position => trigger ids
     mapping(uint256 => uint256) public positionSLId;
-    mapping<uint256 => uint256) public positionTPId;
-    mapping<uint256 => uint256) public positionLIQId;
+    mapping(uint256 => uint256) public positionTPId;
+    mapping(uint256 => uint256) public positionLIQId;
 
     // -------------------------------------------------------
     // Events
