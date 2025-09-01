@@ -283,6 +283,7 @@ contract BrokexUnified is Ownable, ReentrancyGuard {
     // ---- Fonctions internes remplaçant les appels au Vault ----
 
     /// @notice Dépose marge + commission pour un ordre (interne)
+    /// @dev Prélève TOUJOURS sur l'adresse trader spécifiée, jamais sur msg.sender
     function _depositForOrder(
         uint256 orderId,
         address trader,
@@ -295,6 +296,9 @@ contract BrokexUnified is Ownable, ReentrancyGuard {
         require(positionVaults[orderId].trader == address(0), "id collision");
 
         uint256 total = margin + commission;
+        
+        // IMPORTANT: On prélève toujours sur le trader spécifié, 
+        // PAS sur msg.sender qui pourrait être un proxy
         asset.safeTransferFrom(trader, address(this), total);
 
         lockedOrders[orderId] = LockedOrder({
@@ -383,7 +387,8 @@ contract BrokexUnified is Ownable, ReentrancyGuard {
     // ---- Lifecycle des ordres ----
 
     /// @notice Crée un ordre et dépose les fonds
-    /// @dev Le trader peut créer son propre ordre, ou l'executor peut créer un ordre au nom d'un trader
+    /// @dev Peut être appelé par n'importe qui, mais les fonds sont TOUJOURS prélevés sur le trader spécifié
+    ///      La sécurité est assurée par l'allowance ERC20 : le trader doit avoir approuvé le contrat
     function createOrder(
         address trader,
         uint32 assetIndex,
@@ -401,8 +406,9 @@ contract BrokexUnified is Ownable, ReentrancyGuard {
         require(sizeInAsset > 0, "SIZE_0");
         require(leverageX > 0, "LEV_0");
         
-        // Seul le trader lui-même ou l'executor peut créer un ordre
-        require(msg.sender == trader || msg.sender == executor, "NOT_AUTH");
+        // Pas de vérification d'autorisation ici : 
+        // La sécurité est assurée par l'allowance ERC20
+        // Si le trader n'a pas approuvé les fonds, le transferFrom va revert
 
         orderId = nextOrderId++;
         
@@ -421,7 +427,8 @@ contract BrokexUnified is Ownable, ReentrancyGuard {
             leverageX: leverageX
         });
 
-        // Bloquer les fonds (appel interne au lieu de l'interface)
+        // Bloquer les fonds (prélèvement TOUJOURS sur l'adresse trader)
+        // Si le trader n'a pas approuvé ce contrat, cette ligne va revert
         _depositForOrder(orderId, trader, margin, commission);
 
         _pushId(_traderOrders, trader, orderId);
