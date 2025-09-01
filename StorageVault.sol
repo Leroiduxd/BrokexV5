@@ -7,7 +7,6 @@ pragma solidity ^0.8.24;
  * - Stocke et règle la marge, les commissions et le PnL des ordres/positions
  * - Stocke l'état complet des ordres/positions + SL/TP/LIQ
  * - Toutes les opérations financières sont gérées en interne
- * - Compliant avec l'exigence réseau: CHAIN_ID = 688688
  */
 
 import "@openzeppelin/contracts/access/Ownable.sol";
@@ -19,7 +18,6 @@ contract BrokexUnified is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ---- Constantes / Config ----
-    uint256 public constant CHAIN_ID = 688688;
 
     IERC20 public immutable asset;            // stablecoin utilisé pour les règlements
     address public executor;                  // peut exécuter les ordres et fermer les positions
